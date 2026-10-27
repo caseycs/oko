@@ -19,7 +19,7 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
-const USAGE: &str = "Usage: oko mcp [--root DIRECTORY] [--no-jev]\n\nStarts a local MCP server over stdin/stdout. Root defaults to the current directory.\nSearches are restricted to that workspace. Credentials come from the server environment,\nthe root's .env, or the OS credential store. --no-jev is local-only mode.\nThe workspace is prepared in the background at startup; set OKO_NO_PREWARM=1 to wait for the first search.\nSet OKO_METRICS_FILE to append per-search timings and retrieval metadata as JSON lines.";
+const USAGE: &str = "Usage: oko mcp [--root DIRECTORY] [--port PORT] [--no-jev]\n\nStarts a local MCP server over stdin/stdout. Root defaults to the current directory.\nSearches are restricted to that workspace. Credentials come from the server environment,\nthe root's .env, or the OS credential store. --no-jev is local-only mode.\n--port serves streamable HTTP on 127.0.0.1 instead, one server for every session. Without --root,\neach search names an absolute directory; the Git repository holding it is indexed and kept warm\nwith the 7 others searched last. Credentials then come from the starting directory's .env.\nThe workspace is prepared in the background at startup; set OKO_NO_PREWARM=1 to wait for the first search.\nSet OKO_METRICS_FILE to append per-search timings and retrieval metadata as JSON lines.";
 // The serialized tool result, including JSON escaping of the text, before the
 // small JSON-RPC id/envelope added by rmcp.
 const MAX_MCP_RESULT_BYTES: usize = 16_000;
@@ -287,12 +287,54 @@ fn normalize(mut input: SearchInput) -> (SearchInput, Vec<String>) {
 /// requests and ranks on the CPU, so the rest wait for a slot.
 const MAX_CONCURRENT_SEARCHES: usize = 4;
 
+/// Workspaces kept prepared in memory by a server shared across sessions.
+const WARM_WORKSPACES: usize = 8;
+
+/// Prepared workspaces by root, least recently searched first. Each has its
+/// own lock and file watcher, so a search in one repository neither waits for
+/// nor evicts another's.
+#[derive(Default)]
+struct Workspaces(Mutex<Vec<(PathBuf, Arc<Mutex<WorkspaceCache>>)>>);
+impl Workspaces {
+    fn get(&self, root: &Path) -> Arc<Mutex<WorkspaceCache>> {
+        let mut warm = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let cache = match warm.iter().position(|(path, _)| path == root) {
+            Some(index) => warm.remove(index).1,
+            None => Arc::new(Mutex::new(WorkspaceCache::new())),
+        };
+        warm.push((root.to_owned(), Arc::clone(&cache)));
+        if warm.len() > WARM_WORKSPACES {
+            // A search still holding the evicted cache finishes with it.
+            warm.remove(0);
+        }
+        cache
+    }
+}
+
+/// The Git repository holding `directory`, or the directory itself.
+fn repository(directory: &Path) -> PathBuf {
+    directory
+        .ancestors()
+        .find(|path| path.join(".git").exists())
+        .unwrap_or(directory)
+        .to_owned()
+}
+
 #[derive(Clone)]
 struct OkoServer {
-    root: PathBuf,
+    /// The workspace searches are confined to. `None` for a server shared by
+    /// every session: each search names an absolute directory, and its
+    /// workspace is the Git repository holding it.
+    root: Option<PathBuf>,
+    /// Where credentials are read: the root, or where the server started.
+    /// Never a model-selected directory.
+    credentials: PathBuf,
     no_jev: bool,
     gate: Arc<Semaphore>,
-    cache: Arc<Mutex<WorkspaceCache>>,
+    caches: Arc<Workspaces>,
     memory: Arc<Mutex<Memory>>,
     /// Searches in progress, and searches ever started: together they tell a
     /// search whether any other ran during it (parallel subagents share this
@@ -386,17 +428,48 @@ impl OkoServer {
         Ok(())
     }
 
-    /// The directory to search: inside the configured workspace.
-    fn directory(&self, input: &SearchInput) -> Result<PathBuf> {
-        let directory = self
-            .root
-            .join(input.directory.as_deref().unwrap_or("."))
+    /// The workspace root and the directory to search in it: inside the
+    /// configured workspace, or for a shared server any absolute directory.
+    fn workspace(&self, directory: Option<&str>) -> Result<(PathBuf, PathBuf)> {
+        let Some(root) = &self.root else {
+            let directory = directory
+                .filter(|directory| Path::new(directory).is_absolute())
+                .context(
+                    "Pass `directory` as an absolute path: this server is shared by every session.",
+                )?;
+            let directory = Path::new(directory)
+                .canonicalize()
+                .context("Search directory does not exist or cannot be accessed.")?;
+            if !directory.is_dir() {
+                bail!("Search directory must be a directory.");
+            }
+            return Ok((repository(&directory), directory));
+        };
+        let directory = root
+            .join(directory.unwrap_or("."))
             .canonicalize()
             .context("Search directory does not exist or cannot be accessed.")?;
-        if !directory.starts_with(&self.root) || !directory.is_dir() {
+        if !directory.starts_with(root) || !directory.is_dir() {
             bail!("Search directory must be inside the configured workspace.");
         }
-        Ok(directory)
+        Ok((root.clone(), directory))
+    }
+
+    /// The prepared snapshot of `directory`, from the cache kept for `root`.
+    /// Only the refresh is locked: the snapshot stays alive for the request
+    /// without holding the lock during Jev calls.
+    fn load(
+        &self,
+        root: &Path,
+        directory: &Path,
+    ) -> Result<(oko::search_cache::CachedWorkspace, u64)> {
+        let cache = self.caches.get(root);
+        let wait_started = Instant::now();
+        let mut cache = cache.lock().map_err(|_| {
+            anyhow::anyhow!("Search cache worker failed. Restart the server and retry.")
+        })?;
+        let cache_wait_ms = wait_started.elapsed().as_millis() as u64;
+        Ok((cache.load(directory)?, cache_wait_ms))
     }
 
     /// Whether the coverage line should be shown: the session's first, a
@@ -423,12 +496,13 @@ impl OkoServer {
     /// whole workspace, and the directory prefix for rendering paths.
     fn unused_in(
         &self,
-        directory: &std::path::Path,
+        root: &Path,
+        directory: &Path,
         snapshot: &oko::search_cache::WorkspaceSnapshot,
         symbols: &[String],
     ) -> Result<(oko::usages::Unused, String)> {
         let prefix = directory
-            .strip_prefix(&self.root)
+            .strip_prefix(root)
             .ok()
             .map(|p| p.to_string_lossy().replace('\\', "/"))
             .filter(|p| !p.is_empty())
@@ -439,14 +513,7 @@ impl OkoServer {
                 oko::usages::unused(snapshot.navigation(), snapshot.chunks(), symbols, "");
             return Ok((summary, prefix));
         }
-        let whole = self
-            .cache
-            .lock()
-            .map_err(|_| {
-                anyhow::anyhow!("Search cache worker failed. Restart the server and retry.")
-            })?
-            .load(&self.root)?
-            .snapshot;
+        let whole = self.load(root, root)?.0.snapshot;
         let summary = oko::usages::unused(whole.navigation(), whole.chunks(), symbols, &prefix);
         Ok((summary, prefix))
     }
@@ -477,7 +544,7 @@ impl OkoServer {
         let started = Instant::now();
         let (input, early_notes) = normalize(input);
         self.validate(&input)?;
-        let directory = self.directory(&input)?;
+        let (root, directory) = self.workspace(input.directory.as_deref())?;
         let scope = input
             .directory
             .as_deref()
@@ -499,11 +566,10 @@ impl OkoServer {
             .or_else(|| questions.first().cloned())
             .unwrap_or_else(|| symbols.join(" "));
         let question = question_text.as_str();
-        // Credentials belong to the operator-selected root, never a model-selected subdirectory.
         let key = if self.no_jev {
             None
         } else {
-            super::api_key(&self.root)?
+            super::api_key(&self.credentials)?
         };
         if !self.no_jev && key.is_none() {
             bail!(
@@ -514,17 +580,9 @@ impl OkoServer {
             bail!("Search cancelled.");
         }
         let preparation_ms = started.elapsed().as_millis() as u64;
-        // Only snapshot refresh is synchronized. The immutable snapshot remains
-        // alive for this request without holding a lock during Jev calls.
-        // An unfinished startup preparation holds this lock; waiting for it is
-        // never slower than repeating its work.
-        let wait_started = Instant::now();
-        let mut cache = self.cache.lock().map_err(|_| {
-            anyhow::anyhow!("Search cache worker failed. Restart the server and retry.")
-        })?;
-        let cache_wait_ms = wait_started.elapsed().as_millis() as u64;
-        let workspace = cache.load(&directory)?;
-        drop(cache);
+        // An unfinished startup preparation holds the cache lock; waiting for
+        // it is never slower than repeating its work.
+        let (workspace, cache_wait_ms) = self.load(&root, &directory)?;
         let snapshot = workspace.snapshot;
         let corpus = snapshot.chunks();
         if cancelled() {
@@ -537,6 +595,7 @@ impl OkoServer {
             questions: &questions,
             symbols: &symbols,
             scope: &scope,
+            root: &root,
             directory: &directory,
             snapshot: &snapshot,
             scans: &scans,
@@ -624,7 +683,15 @@ impl OkoServer {
         let value = input.prefetch.take().unwrap_or_default();
         let (client, session) = oko::prefetch::client_session(&value);
         let prompt = input.question.take().unwrap_or_default();
-        let context = match self.prefetch_answer(client, session, &prompt, started, cancelled) {
+        let directory = input.directory.take();
+        let context = match self.prefetch_answer(
+            client,
+            session,
+            &prompt,
+            directory.as_deref(),
+            started,
+            cancelled,
+        ) {
             Ok(Prefetched::Context(context)) => Some(context),
             Ok(Prefetched::Nothing(reason)) => {
                 record_prefetch_skip(&prompt, reason, None, None, started);
@@ -655,6 +722,7 @@ impl OkoServer {
         client: &str,
         session: &str,
         prompt: &str,
+        directory: Option<&str>,
         started: Instant,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<Prefetched> {
@@ -680,22 +748,19 @@ impl OkoServer {
             Ok(read) => read,
             Err(reason) => return Ok(Prefetched::Nothing(reason)),
         };
+        // The session's directory, which the hook passes; a shared server
+        // without one has no workspace to search.
+        let (root, directory) = self.workspace(directory)?;
         let key = if self.no_jev {
             None
         } else {
-            match super::api_key(&self.root)? {
+            match super::api_key(&self.credentials)? {
                 Some(key) => Some(key),
                 None => return Ok(Prefetched::Nothing("no key")),
             }
         };
         let flight = Flight::begin(&self.in_flight, &self.started);
-        let wait_started = Instant::now();
-        let mut cache = self.cache.lock().map_err(|_| {
-            anyhow::anyhow!("Search cache worker failed. Restart the server and retry.")
-        })?;
-        let cache_wait_ms = wait_started.elapsed().as_millis() as u64;
-        let workspace = cache.load(&self.root)?;
-        drop(cache);
+        let (workspace, cache_wait_ms) = self.load(&root, &directory)?;
         let snapshot = workspace.snapshot;
         let corpus = snapshot.chunks();
         // Names and paths the index knows make a prompt strong; a code
@@ -757,7 +822,8 @@ impl OkoServer {
             questions: &questions,
             symbols: &[],
             scope: "the workspace",
-            directory: &self.root,
+            root: &root,
+            directory: &directory,
             snapshot: &snapshot,
             scans: &scans,
             key,
@@ -822,7 +888,7 @@ impl OkoServer {
         }
         let context_started = Instant::now();
         let notes = self.notes(&ask, &mut found, &workspace.timings, None);
-        let metadata = json!({"question": prefix(question, 512), "directory": self.root,
+        let metadata = json!({"question": prefix(question, 512), "directory": directory,
             "ranking": if judged {"jev"} else {"lexical"},
             "prefetch": {"decision": "inject", "client": client, "session": session, "strong": strong},
             "retrieval": found.retrieval, "floor": found.floor, "focused": found.focused,
@@ -963,7 +1029,8 @@ impl OkoServer {
             found.symbols_missing = missing_symbols(ask.symbols, &named.pins);
         }
         if ask.input.mode == Some(Mode::Unused) {
-            let (summary, prefix) = self.unused_in(ask.directory, ask.snapshot, ask.symbols)?;
+            let (summary, prefix) =
+                self.unused_in(ask.root, ask.directory, ask.snapshot, ask.symbols)?;
             found
                 .notes
                 .push(oko::usages::render_unused(&summary, ask.scope, &prefix));
@@ -993,7 +1060,8 @@ impl OkoServer {
         if asks_unused(ask.input, ask.question) {
             // Uses are counted over the whole workspace; only the candidates
             // come from the searched directory.
-            let (summary, prefix) = self.unused_in(ask.directory, ask.snapshot, ask.symbols)?;
+            let (summary, prefix) =
+                self.unused_in(ask.root, ask.directory, ask.snapshot, ask.symbols)?;
             let text = oko::usages::render_unused(&summary, ask.scope, &prefix);
             if route == Route::Unused {
                 found.direct = Some(text);
@@ -1198,7 +1266,7 @@ impl OkoServer {
         } else {
             String::new()
         };
-        if let Ok(scope) = ask.directory.strip_prefix(&self.root)
+        if let Ok(scope) = ask.directory.strip_prefix(ask.root)
             && !scope.as_os_str().is_empty()
         {
             notes.push_str(&format!("Paths are relative to {}/.\n", scope.display()));
@@ -1559,7 +1627,9 @@ struct Ask<'a> {
     symbols: &'a [String],
     /// The searched directory as the answer names it ("the workspace").
     scope: &'a str,
-    directory: &'a std::path::Path,
+    /// The workspace `directory` is in: its uses count over the whole of it.
+    root: &'a Path,
+    directory: &'a Path,
     snapshot: &'a Arc<oko::search_cache::WorkspaceSnapshot>,
     /// Name scans shared by every listing and line of this search.
     scans: &'a oko::usages::Scans<'a>,
@@ -2146,10 +2216,11 @@ fn prewarm(server: &OkoServer) {
             "1" | "true" | "yes" | "on"
         )
     });
-    if disabled {
+    // A shared server learns its workspaces from the searches.
+    let Some(root) = server.root.clone().filter(|_| !disabled) else {
         return;
-    }
-    let (cache, root) = (server.cache.clone(), server.root.clone());
+    };
+    let cache = server.caches.get(&root);
     std::thread::spawn(move || {
         let Ok(mut cache) = cache.lock() else {
             return;
@@ -2232,9 +2303,11 @@ fn failure(message: &str) -> CallToolResult {
 )]
 impl ServerHandler for OkoServer {}
 
-/// The workspace root and local-only flag from `--root DIRECTORY [--no-jev]`.
-fn workspace(args: &[String], cwd: &Path) -> Result<(PathBuf, bool)> {
+/// The workspace root, port and local-only flag from
+/// `--root DIRECTORY [--port PORT] [--no-jev]`.
+fn workspace(args: &[String], cwd: &Path) -> Result<(Option<PathBuf>, Option<u16>, bool)> {
     let mut root = None;
+    let mut port = None;
     let mut no_jev = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -2242,11 +2315,22 @@ fn workspace(args: &[String], cwd: &Path) -> Result<(PathBuf, bool)> {
             "--root" if root.is_none() => {
                 root = Some(args.next().context("--root needs a directory.")?)
             }
+            "--port" if port.is_none() => {
+                port = Some(
+                    args.next()
+                        .and_then(|port| port.parse::<u16>().ok())
+                        .context("--port needs a port number.")?,
+                )
+            }
             "--no-jev" if !no_jev => no_jev = true,
             _ => bail!("Invalid MCP arguments.\n{USAGE}"),
         }
     }
-    let given = root.map_or(".", String::as_str);
+    // Over stdio the workspace defaults to the current directory; a shared
+    // server is confined to a root only when given one.
+    let Some(given) = root.map(String::as_str).or(port.is_none().then_some(".")) else {
+        return Ok((None, port, no_jev));
+    };
     // A path pasted into an app's settings form often carries a stray space;
     // the exact path wins when it exists.
     let root = cwd
@@ -2261,19 +2345,20 @@ fn workspace(args: &[String], cwd: &Path) -> Result<(PathBuf, bool)> {
         bail!("MCP workspace root must be a directory.");
     }
     oko::jev_log::set_workspace(&root);
-    Ok((root, no_jev))
+    Ok((Some(root), port, no_jev))
 }
 
 impl OkoServer {
-    fn new(root: PathBuf, no_jev: bool) -> Self {
+    fn new(root: Option<PathBuf>, cwd: &Path, no_jev: bool) -> Self {
         OkoServer {
+            credentials: root.clone().unwrap_or_else(|| cwd.to_owned()),
             root,
             no_jev,
             gate: Arc::new(Semaphore::new(MAX_CONCURRENT_SEARCHES)),
-            cache: Arc::new(Mutex::new(WorkspaceCache::new())),
-            memory: Arc::new(Mutex::new(Memory::default())),
-            in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            started: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            caches: Arc::default(),
+            memory: Arc::default(),
+            in_flight: Arc::default(),
+            started: Arc::default(),
         }
     }
 }
@@ -2283,8 +2368,8 @@ pub fn run(args: &[String], cwd: &Path) -> Result<()> {
         println!("{USAGE}");
         return Ok(());
     }
-    let (root, no_jev) = workspace(args, cwd)?;
-    let server = OkoServer::new(root, no_jev);
+    let (root, port, no_jev) = workspace(args, cwd)?;
+    let server = OkoServer::new(root, cwd, no_jev);
     prewarm(&server);
     // The daily check for a newer release, for the session-start notice;
     // local-only mode makes no network calls.
@@ -2295,6 +2380,9 @@ pub fn run(args: &[String], cwd: &Path) -> Result<()> {
         .enable_all()
         .build()?
         .block_on(async {
+            if let Some(port) = port {
+                return serve_http(server, port).await;
+            }
             let service = server.serve(rmcp::transport::stdio()).await?;
             service.waiting().await?;
             Ok(())
@@ -2312,7 +2400,7 @@ pub fn cursor_prompt(args: &[String], cwd: &Path) -> Result<()> {
         &mut std::io::Read::take(std::io::stdin(), 1 << 20),
         &mut input,
     );
-    let context = workspace(args, cwd).ok().and_then(|(root, no_jev)| {
+    let context = workspace(args, cwd).ok().and_then(|(root, _, no_jev)| {
         let event: Value = serde_json::from_str(&input).ok()?;
         let search = serde_json::from_value(json!({
             "question": event["prompt"].as_str()?,
@@ -2320,7 +2408,8 @@ pub fn cursor_prompt(args: &[String], cwd: &Path) -> Result<()> {
         }))
         .ok()?;
         let result =
-            serde_json::to_value(OkoServer::new(root, no_jev).prefetch(search, &|| false)).ok()?;
+            serde_json::to_value(OkoServer::new(root, cwd, no_jev).prefetch(search, &|| false))
+                .ok()?;
         let hook: Value = serde_json::from_str(result["content"][0]["text"].as_str()?).ok()?;
         hook["hookSpecificOutput"]["additionalContext"]
             .as_str()
@@ -2334,6 +2423,42 @@ pub fn cursor_prompt(args: &[String], cwd: &Path) -> Result<()> {
     Ok(())
 }
 
+/// One server for every client session, over streamable HTTP on localhost.
+/// Sessions share the prepared workspaces, credentials and search slots;
+/// what was sent, and which searches overlap, belong to each session.
+async fn serve_http(server: OkoServer, port: u16) -> Result<()> {
+    use rmcp::transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+    };
+    let service = StreamableHttpService::new(
+        move || {
+            Ok(OkoServer {
+                memory: Arc::default(),
+                in_flight: Arc::default(),
+                started: Arc::default(),
+                ..server.clone()
+            })
+        },
+        Arc::new(LocalSessionManager::default()),
+        StreamableHttpServerConfig::default(),
+    );
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .with_context(|| format!("Cannot listen on 127.0.0.1:{port}."))?;
+    // The actual port, for `--port 0`.
+    eprintln!("oko: serving MCP on http://{}/mcp", listener.local_addr()?);
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let service = hyper_util::service::TowerToHyperService::new(service.clone());
+        tokio::spawn(async move {
+            // A client that drops its connection ends only that connection.
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .await;
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2343,8 +2468,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().canonicalize().unwrap();
         let padded = format!(" {} ", project.display());
-        let (root, _) = workspace(&["--root".into(), padded], Path::new("/")).unwrap();
-        assert_eq!(root, project);
+        let (root, _, _) = workspace(&["--root".into(), padded], Path::new("/")).unwrap();
+        assert_eq!(root, Some(project));
         let missing = workspace(
             &["--root".into(), " /no/such/oko/root".into()],
             Path::new("/"),
