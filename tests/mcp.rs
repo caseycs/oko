@@ -3125,9 +3125,10 @@ fn one_http_server_serves_every_session_in_the_repository_each_search_names() {
         .spawn()
         .unwrap();
     let mut announced = String::new();
-    BufReader::new(child.stderr.take().unwrap())
-        .read_line(&mut announced)
-        .unwrap();
+    let mut log = BufReader::new(child.stderr.take().unwrap());
+    log.read_line(&mut announced).unwrap();
+    // Keep reading: the server logs why a session has no roots.
+    thread::spawn(move || std::io::copy(&mut log, &mut std::io::sink()));
     let url = announced
         .trim()
         .strip_prefix("oko: serving MCP on ")
@@ -3159,6 +3160,15 @@ fn one_http_server_serves_every_session_in_the_repository_each_search_names() {
         "fn authenticate() { validate_token(); }\n",
     )
     .unwrap();
+
+    // 2026-07-28 has no sessions, so no roots: a client offering it gets
+    // the latest revision that has them.
+    let mut newest = HttpClient::connect(&url, None);
+    let offered = newest.request("initialize", json!({"protocolVersion":"2026-07-28","capabilities":{"roots":{}},"clientInfo":{"name":"oko-tests","version":"1"}}));
+    assert_eq!(
+        offered["result"]["protocolVersion"], "2025-11-25",
+        "{offered}"
+    );
 
     let mut first = HttpClient::connect(&url, None);
     let mut second = HttpClient::connect(&url, Some(&other));
