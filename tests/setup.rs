@@ -444,6 +444,89 @@ fn claude_setup_replaces_its_own_connection_and_refuses_another() {
 }
 #[cfg(unix)]
 #[test]
+fn claude_setup_with_a_port_connects_every_project_to_one_server() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    let config = temp.path().join("claude-config");
+    let install = temp.path().join("bin");
+    fs::create_dir(&root).unwrap();
+    let run = |claude: &Path| {
+        Command::new(executable())
+            .args(["setup", "--no-jev", "--client", "claude", "--port", "9437"])
+            .arg("--root")
+            .arg(&root)
+            .arg("--install-dir")
+            .arg(&install)
+            .env("OKO_CLAUDE", claude)
+            .env("CLAUDE_CONFIG_DIR", &config)
+            .output()
+            .unwrap()
+    };
+    let output = run(&fake_claude(temp.path(), None));
+    assert_ok(&output);
+    assert!(String::from_utf8_lossy(&output.stdout).contains("mcp --port 9437 --no-jev"));
+    let log = fs::read_to_string(temp.path().join("claude.log")).unwrap();
+    let added = log
+        .lines()
+        .find_map(|line| line.strip_prefix("mcp|add-json|--scope|user|oko|"))
+        .and_then(|rest| rest.strip_suffix('|'))
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(added).unwrap(),
+        serde_json::json!({
+            "type": "http",
+            "url": "http://127.0.0.1:9437/mcp",
+            "headers": {"X-Oko-Directory": "${PWD}"},
+            "alwaysLoad": true,
+        })
+    );
+    // Hooks, permission and guidance go to the user's configuration; the
+    // project is left as it was.
+    let settings = fs::read_to_string(config.join("settings.json")).unwrap();
+    assert!(settings.contains("mcp__oko__search") && settings.contains("UserPromptSubmit"));
+    assert!(
+        fs::read_to_string(config.join("CLAUDE.md"))
+            .unwrap()
+            .contains("<!-- oko:search:start -->")
+    );
+    assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+    let listed: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(install.join("projects.json")).unwrap()).unwrap();
+    assert_eq!(listed["projects"][0]["port"], 9437);
+
+    // Its own shared connection is replaced; a project's own is left beside it.
+    for (described, removed) in [
+        (
+            "oko:\n  Scope: User config (available in all your projects)\n  Type: http\n  URL: http://127.0.0.1:9437/mcp",
+            true,
+        ),
+        (
+            "oko:\n  Scope: Local config (private to you in this project)\n  Type: stdio\n  Command: /old/oko\n  Args: mcp --root /project",
+            false,
+        ),
+    ] {
+        fs::remove_file(temp.path().join("claude.log")).unwrap();
+        assert_ok(&run(&fake_claude(temp.path(), Some(described))));
+        let log = fs::read_to_string(temp.path().join("claude.log")).unwrap();
+        assert_eq!(
+            log.contains("mcp|remove|--scope|user|oko|"),
+            removed,
+            "{log}"
+        );
+        assert!(log.contains("mcp|add-json|--scope|user|oko|"));
+    }
+
+    let output = setup(
+        executable(),
+        &root,
+        &install,
+        &["--no-jev", "--client", "codex", "--port", "9437"],
+    );
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--client claude"));
+}
+#[cfg(unix)]
+#[test]
 fn a_missing_claude_command_or_unknown_client_changes_nothing() {
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("project");
