@@ -3035,15 +3035,17 @@ fn without_jev_a_prefetch_shows_only_definitions_the_prompt_names() {
     assert!(!context.contains("forecast"), "{context}");
 }
 
-/// A JSON-RPC exchange with `oko mcp --port`, over streamable HTTP.
+/// A JSON-RPC exchange with `oko mcp --port`, over streamable HTTP. With
+/// `root`, the client declares roots and answers the server's `roots/list`.
 struct HttpClient {
     url: String,
     session: Option<String>,
+    root: Option<String>,
     http: reqwest::blocking::Client,
     id: u64,
 }
 impl HttpClient {
-    fn post(&mut self, body: Value) -> reqwest::blocking::Response {
+    fn post(&self, body: Value) -> reqwest::blocking::Response {
         let mut request = self
             .http
             .post(&self.url)
@@ -3054,6 +3056,8 @@ impl HttpClient {
         }
         request.send().unwrap()
     }
+    /// The response to a request, read from its event stream as it arrives:
+    /// the server may ask for the roots before it answers.
     fn request(&mut self, method: &str, params: Value) -> Value {
         self.id += 1;
         let response =
@@ -3061,21 +3065,38 @@ impl HttpClient {
         if let Some(session) = response.headers().get("mcp-session-id") {
             self.session = Some(session.to_str().unwrap().to_owned());
         }
-        let body = response.text().unwrap();
-        body.lines()
-            .filter_map(|line| line.strip_prefix("data: "))
-            .filter_map(|data| serde_json::from_str::<Value>(data).ok())
-            .find(|message| message.get("id") == Some(&json!(self.id)))
-            .unwrap_or_else(|| panic!("no response in {body}"))
+        for line in BufReader::new(response).lines() {
+            let line = line.unwrap();
+            let Some(message) = line
+                .strip_prefix("data: ")
+                .and_then(|data| serde_json::from_str::<Value>(data).ok())
+            else {
+                continue;
+            };
+            if message["method"] == "roots/list" {
+                let uri = format!("file://{}", self.root.as_deref().unwrap());
+                self.post(json!({"jsonrpc":"2.0", "id":message["id"],
+                    "result":{"roots":[{"uri":uri.replace(' ', "%20")}]}}));
+            } else if message.get("id") == Some(&json!(self.id)) {
+                return message;
+            }
+        }
+        panic!("no response to {method}");
     }
-    fn connect(url: &str) -> Self {
+    fn connect(url: &str, root: Option<&Path>) -> Self {
         let mut client = Self {
             url: url.to_owned(),
             session: None,
+            root: root.map(|root| root.to_str().unwrap().to_owned()),
             http: reqwest::blocking::Client::new(),
             id: 0,
         };
-        let response = client.request("initialize", json!({"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"oko-tests","version":"1"}}));
+        let capabilities = if root.is_some() {
+            json!({"roots":{}})
+        } else {
+            json!({})
+        };
+        let response = client.request("initialize", json!({"protocolVersion":"2024-11-05","capabilities":capabilities,"clientInfo":{"name":"oko-tests","version":"1"}}));
         assert!(response.get("error").is_none(), "{response}");
         client.post(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
         client
@@ -3129,13 +3150,21 @@ fn one_http_server_serves_every_session_in_the_repository_each_search_names() {
         "fn authenticate_user() { validate_token(); }\n",
     )
     .unwrap();
-    let other = fixture();
+    // Started in a directory whose name needs escaping in a URI.
+    let parent = tempfile::tempdir().unwrap();
+    let other = parent.path().canonicalize().unwrap().join("my project");
+    fs::create_dir(&other).unwrap();
+    fs::write(
+        other.join("auth.rs"),
+        "fn authenticate() { validate_token(); }\n",
+    )
+    .unwrap();
 
-    let mut first = HttpClient::connect(&url);
-    let mut second = HttpClient::connect(&url);
+    let mut first = HttpClient::connect(&url, None);
+    let mut second = HttpClient::connect(&url, Some(&other));
     assert_ne!(first.session, second.session);
 
-    // A shared server has no directory of its own to fall back on.
+    // A client without roots must name an absolute directory.
     let (failed, text) = first.search(json!({"question":"authentication token"}));
     assert!(failed, "{text}");
     assert!(text.contains("absolute path"), "{text}");
@@ -3151,22 +3180,26 @@ fn one_http_server_serves_every_session_in_the_repository_each_search_names() {
     assert!(text.contains("Paths are relative to server/."), "{text}");
     assert!(text.contains("auth.rs:1-1 (whole file)"), "{text}");
 
-    // Another session searches another directory on the same server.
-    let (failed, text) = second.search(
-        json!({"question":"authentication token", "directory":other.path().to_str().unwrap()}),
-    );
-    assert!(!failed, "{text}");
-    assert!(text.contains("auth.rs:1-1 (whole file)"), "{text}");
-    assert!(!text.contains("Paths are relative"), "{text}");
+    // Another session searches the directory it was started in, which its
+    // client names as its root; a relative directory is taken from there.
+    for args in [
+        json!({"question":"authentication token"}),
+        json!({"question":"authentication token", "directory":"."}),
+    ] {
+        let (failed, text) = second.search(args);
+        assert!(!failed, "{text}");
+        assert!(text.contains("auth.rs:1-1 (whole file)"), "{text}");
+        assert!(!text.contains("Paths are relative"), "{text}");
+    }
 
-    // The prompt hook passes the session's directory; without one there is
-    // nothing to search, and the prompt goes on without context.
+    // The prompt hook passes the session's directory; without one, and
+    // without roots, there is nothing to search and the prompt goes on.
     let prompt = "Explain how authenticate_user checks the token";
-    let (failed, text) = second.search(json!({"question":prompt, "prefetch":"claude:s2"}));
+    let (failed, text) = first.search(json!({"question":prompt, "prefetch":"claude:s1"}));
     assert!(!failed, "{text}");
     assert_eq!(text, "{}");
-    let (failed, text) = second.search(
-        json!({"question":format!("{prompt}?"), "prefetch":"claude:s2",
+    let (failed, text) = first.search(
+        json!({"question":format!("{prompt}?"), "prefetch":"claude:s1",
         "directory":repository.path().to_str().unwrap()}),
     );
     let context = hook_context(&json!({"result":{"isError":failed, "content":[{"text":text}]}}))

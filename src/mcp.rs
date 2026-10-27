@@ -19,7 +19,7 @@ use std::{
 };
 use tokio::sync::Semaphore;
 
-const USAGE: &str = "Usage: oko mcp [--root DIRECTORY] [--port PORT] [--no-jev]\n\nStarts a local MCP server over stdin/stdout. Root defaults to the current directory.\nSearches are restricted to that workspace. Credentials come from the server environment,\nthe root's .env, or the OS credential store. --no-jev is local-only mode.\n--port serves streamable HTTP on 127.0.0.1 instead, one server for every session. Without --root,\neach search names an absolute directory; the Git repository holding it is indexed and kept warm\nwith the 7 others searched last. Credentials then come from the starting directory's .env.\nThe workspace is prepared in the background at startup; set OKO_NO_PREWARM=1 to wait for the first search.\nSet OKO_METRICS_FILE to append per-search timings and retrieval metadata as JSON lines.";
+const USAGE: &str = "Usage: oko mcp [--root DIRECTORY] [--port PORT] [--no-jev]\n\nStarts a local MCP server over stdin/stdout. Root defaults to the current directory.\nSearches are restricted to that workspace. Credentials come from the server environment,\nthe root's .env, or the OS credential store. --no-jev is local-only mode.\n--port serves streamable HTTP on 127.0.0.1 instead, one server for every session. Without --root,\neach search names an absolute directory, else one relative to the client's first root (Claude Code:\nwhere the session started); the Git repository holding it is indexed and kept warm with the 7 others\nsearched last. Credentials then come from the starting directory's .env.\nThe workspace is prepared in the background at startup; set OKO_NO_PREWARM=1 to wait for the first search.\nSet OKO_METRICS_FILE to append per-search timings and retrieval metadata as JSON lines.";
 // The serialized tool result, including JSON escaping of the text, before the
 // small JSON-RPC id/envelope added by rmcp.
 const MAX_MCP_RESULT_BYTES: usize = 16_000;
@@ -341,6 +341,8 @@ struct OkoServer {
     /// server but not each other's context).
     in_flight: Arc<std::sync::atomic::AtomicUsize>,
     started: Arc<std::sync::atomic::AtomicUsize>,
+    /// A shared server's session directory: the client's first root.
+    session_root: Arc<Mutex<Option<PathBuf>>>,
 }
 
 /// One search's place among the others: it overlapped another if one was
@@ -2255,9 +2257,21 @@ impl OkoServer {
     )]
     async fn search_tool(
         &self,
-        Parameters(input): Parameters<SearchInput>,
+        Parameters(mut input): Parameters<SearchInput>,
         context: RequestContext<RoleServer>,
     ) -> CallToolResult {
+        // A shared server searches the session's directory: a missing or
+        // relative `directory` is taken from the client's first root.
+        if self.root.is_none()
+            && !input
+                .directory
+                .as_deref()
+                .is_some_and(|directory| Path::new(directory).is_absolute())
+            && let Some(base) = self.session_directory(&context).await
+        {
+            let named = input.directory.take().unwrap_or_default();
+            input.directory = Some(base.join(named).to_string_lossy().into_owned());
+        }
         // Agents issue searches in parallel; a busy error only makes them retry
         // one at a time or give up on Oko. Extra calls wait for a slot instead.
         let permit = match context
@@ -2287,6 +2301,58 @@ impl OkoServer {
         }
     }
 }
+impl OkoServer {
+    /// The session's directory: the client's first `file://` root, asked once
+    /// per session. Claude Code answers with the directory it was started in.
+    /// SEP-2577 deprecates roots, but clients still answer them.
+    #[allow(deprecated)]
+    async fn session_directory(&self, context: &RequestContext<RoleServer>) -> Option<PathBuf> {
+        if let Some(root) = lock_recovered(&self.session_root).clone() {
+            return Some(root);
+        }
+        let supported = context
+            .peer
+            .peer_info()
+            .is_some_and(|info| info.capabilities.roots.is_some());
+        if !supported {
+            return None;
+        }
+        // A client that never answers must not hold up the search.
+        let listed = tokio::time::timeout(Duration::from_secs(2), context.peer.list_roots())
+            .await
+            .ok()?
+            .ok()?;
+        let root = listed
+            .roots
+            .iter()
+            .find_map(|root| root.uri.strip_prefix("file://").and_then(percent_decoded))
+            .map(PathBuf::from)?;
+        *lock_recovered(&self.session_root) = Some(root.clone());
+        Some(root)
+    }
+}
+/// A lock whose value is only ever replaced whole, recovered after a panic.
+fn lock_recovered<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+/// A `file://` URI path with its `%XX` escapes decoded.
+fn percent_decoded(path: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(path.len());
+    let mut rest = path.as_bytes();
+    while let Some((&byte, tail)) = rest.split_first() {
+        if byte == b'%' && tail.len() >= 2 {
+            bytes.push(u8::from_str_radix(std::str::from_utf8(&tail[..2]).ok()?, 16).ok()?);
+            rest = &tail[2..];
+        } else {
+            bytes.push(byte);
+            rest = tail;
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// Claude Code defers MCP tools behind a tool search, so an agent sees only
 /// the name until it loads the schema, and in practice reaches for grep
 /// instead. This loads the tool at startup however the server was added.
@@ -2359,6 +2425,7 @@ impl OkoServer {
             memory: Arc::default(),
             in_flight: Arc::default(),
             started: Arc::default(),
+            session_root: Arc::default(),
         }
     }
 }
@@ -2436,6 +2503,7 @@ async fn serve_http(server: OkoServer, port: u16) -> Result<()> {
                 memory: Arc::default(),
                 in_flight: Arc::default(),
                 started: Arc::default(),
+                session_root: Arc::default(),
                 ..server.clone()
             })
         },
