@@ -1335,6 +1335,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "dirs",
+ "http",
  "hyper",
  "hyper-util",
  "keyring",
