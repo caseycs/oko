@@ -3034,3 +3034,245 @@ fn without_jev_a_prefetch_shows_only_definitions_the_prompt_names() {
     assert!(context.contains("pub fn retry_upload"), "{context}");
     assert!(!context.contains("forecast"), "{context}");
 }
+
+/// A JSON-RPC exchange with `oko mcp --port`, over streamable HTTP. With
+/// `root`, the client declares roots and answers the server's `roots/list`;
+/// with `header`, it names its directory in `X-Oko-Directory`.
+struct HttpClient {
+    url: String,
+    session: Option<String>,
+    root: Option<String>,
+    header: Option<String>,
+    /// The negotiated revision, sent with every later request.
+    version: Option<String>,
+    http: reqwest::blocking::Client,
+    id: u64,
+}
+impl HttpClient {
+    fn post(&self, mut body: Value) -> reqwest::blocking::Response {
+        let mut request = self
+            .http
+            .post(&self.url)
+            .header("Accept", "application/json, text/event-stream");
+        // 2026-07-28 names the call in headers and the client in `_meta`.
+        if self.version.as_deref() == Some("2026-07-28")
+            && let Some(method) = body["method"].as_str().map(str::to_owned)
+        {
+            request = request.header("Mcp-Method", method);
+            if let Some(name) = body["params"]["name"].as_str() {
+                request = request.header("Mcp-Name", name);
+            }
+            body["params"]["_meta"] = json!({"io.modelcontextprotocol/protocolVersion":"2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities":{}});
+        }
+        let mut request = request.json(&body);
+        if let Some(session) = &self.session {
+            request = request.header("Mcp-Session-Id", session);
+        }
+        if let Some(header) = &self.header {
+            request = request.header("X-Oko-Directory", header);
+        }
+        if let Some(version) = &self.version {
+            request = request.header("MCP-Protocol-Version", version);
+        }
+        request.send().unwrap()
+    }
+    /// The response to a request, read from its event stream as it arrives:
+    /// the server may ask for the roots before it answers.
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        self.id += 1;
+        let response =
+            self.post(json!({"jsonrpc":"2.0", "id":self.id, "method":method, "params":params}));
+        if let Some(session) = response.headers().get("mcp-session-id") {
+            self.session = Some(session.to_str().unwrap().to_owned());
+        }
+        for line in BufReader::new(response).lines() {
+            let line = line.unwrap();
+            // An event stream's data lines, or a plain JSON body.
+            let Some(message) =
+                serde_json::from_str::<Value>(line.strip_prefix("data: ").unwrap_or(&line)).ok()
+            else {
+                continue;
+            };
+            if message["method"] == "roots/list" {
+                let uri = format!("file://{}", self.root.as_deref().unwrap());
+                self.post(json!({"jsonrpc":"2.0", "id":message["id"],
+                    "result":{"roots":[{"uri":uri.replace(' ', "%20")}]}}));
+            } else if message.get("id") == Some(&json!(self.id)) {
+                return message;
+            }
+        }
+        panic!("no response to {method}");
+    }
+    fn connect(url: &str, root: Option<&Path>) -> Self {
+        Self::connect_with(url, root, None, "2024-11-05")
+    }
+    fn connect_with(url: &str, root: Option<&Path>, header: Option<&Path>, version: &str) -> Self {
+        let mut client = Self {
+            url: url.to_owned(),
+            session: None,
+            root: root.map(|root| root.to_str().unwrap().to_owned()),
+            header: header.map(|header| header.to_str().unwrap().to_owned()),
+            version: None,
+            http: reqwest::blocking::Client::new(),
+            id: 0,
+        };
+        // 2026-07-28 has no handshake: every request names its revision.
+        if version == "2026-07-28" {
+            client.version = Some(version.to_owned());
+            return client;
+        }
+        let capabilities = if root.is_some() {
+            json!({"roots":{}})
+        } else {
+            json!({})
+        };
+        let response = client.request("initialize", json!({"protocolVersion":version,"capabilities":capabilities,"clientInfo":{"name":"oko-tests","version":"1"}}));
+        assert!(response.get("error").is_none(), "{response}");
+        client.version = response["result"]["protocolVersion"]
+            .as_str()
+            .map(str::to_owned);
+        client.post(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+        client
+    }
+    fn search(&mut self, args: Value) -> (bool, String) {
+        let response = self.request("tools/call", json!({"name":"search","arguments":args}));
+        let result = &response["result"];
+        (
+            result["isError"] == true,
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{response}"))
+                .to_owned(),
+        )
+    }
+}
+
+#[test]
+fn one_http_server_serves_every_session_in_the_repository_each_search_names() {
+    let cache = tempfile::tempdir().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_oko"))
+        .args(["mcp", "--port", "0", "--no-jev"])
+        .env("OKO_CACHE_DIR", cache.path())
+        .env("OKO_NO_CACHE", "0")
+        .env("TYPESAFE_API_KEY", "")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut announced = String::new();
+    let mut log = BufReader::new(child.stderr.take().unwrap());
+    log.read_line(&mut announced).unwrap();
+    // Keep reading: the server logs why a session has no roots.
+    thread::spawn(move || std::io::copy(&mut log, &mut std::io::sink()));
+    let url = announced
+        .trim()
+        .strip_prefix("oko: serving MCP on ")
+        .unwrap_or_else(|| panic!("{announced}"))
+        .to_owned();
+    struct Kill(Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _server = Kill(child);
+
+    let repository = tempfile::tempdir().unwrap();
+    fs::create_dir_all(repository.path().join(".git")).unwrap();
+    fs::create_dir_all(repository.path().join("server")).unwrap();
+    fs::write(
+        repository.path().join("server/auth.rs"),
+        "fn authenticate_user() { validate_token(); }\n",
+    )
+    .unwrap();
+    // Started in a directory whose name needs escaping in a URI.
+    let parent = tempfile::tempdir().unwrap();
+    let other = parent.path().canonicalize().unwrap().join("my project");
+    fs::create_dir(&other).unwrap();
+    fs::write(
+        other.join("auth.rs"),
+        "fn authenticate() { validate_token(); }\n",
+    )
+    .unwrap();
+
+    let mut first = HttpClient::connect(&url, None);
+    let mut second = HttpClient::connect(&url, Some(&other));
+    assert_ne!(first.session, second.session);
+
+    // A client without roots must name an absolute directory.
+    let (failed, text) = first.search(json!({"question":"authentication token"}));
+    assert!(failed, "{text}");
+    assert!(text.contains("absolute path"), "{text}");
+    let (failed, text) =
+        first.search(json!({"question":"authentication token", "directory":"server"}));
+    assert!(failed && text.contains("absolute path"), "{text}");
+
+    // The workspace is the repository holding the directory searched.
+    let server = repository.path().join("server");
+    let (failed, text) = first
+        .search(json!({"question":"authentication token", "directory":server.to_str().unwrap()}));
+    assert!(!failed, "{text}");
+    assert!(text.contains("Paths are relative to server/."), "{text}");
+    assert!(text.contains("auth.rs:1-1 (whole file)"), "{text}");
+
+    // Another session searches the directory it was started in, which its
+    // client names as its root; a relative directory is taken from there.
+    for args in [
+        json!({"question":"authentication token"}),
+        json!({"question":"authentication token", "directory":"."}),
+    ] {
+        let (failed, text) = second.search(args);
+        assert!(!failed, "{text}");
+        assert!(text.contains("auth.rs:1-1 (whole file)"), "{text}");
+        assert!(!text.contains("Paths are relative"), "{text}");
+    }
+
+    // 2026-07-28 has no sessions, so a session's memory would not last
+    // between calls: a client offering it gets the latest revision with
+    // sessions, and its MCP config names its directory in a header.
+    let mut headed = HttpClient::connect_with(&url, None, Some(&server), "2026-07-28");
+    headed.version = None;
+    let offered = headed.request("initialize", json!({"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"oko-tests","version":"1"}}));
+    assert_eq!(
+        offered["result"]["protocolVersion"], "2025-11-25",
+        "{offered}"
+    );
+    assert!(headed.session.is_some());
+    headed.version = Some("2025-11-25".into());
+    headed.post(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    let (failed, text) = headed.search(json!({"question":"authentication token"}));
+    assert!(!failed, "{text}");
+    assert!(text.contains("Paths are relative to server/."), "{text}");
+
+    // A client that skips the handshake is told which revisions to use.
+    let mut stateless = HttpClient::connect_with(&url, None, Some(&server), "2026-07-28");
+    let refused = stateless.request(
+        "tools/call",
+        json!({"name":"search","arguments":{"question":"authentication token"}}),
+    );
+    assert_eq!(
+        refused["error"]["data"]["supported"]
+            .as_array()
+            .unwrap()
+            .last(),
+        Some(&json!("2025-11-25")),
+        "{refused}"
+    );
+
+    // The prompt hook passes the session's directory; without one, and
+    // without roots, there is nothing to search and the prompt goes on.
+    let prompt = "Explain how authenticate_user checks the token";
+    let (failed, text) = first.search(json!({"question":prompt, "prefetch":"claude:s1"}));
+    assert!(!failed, "{text}");
+    assert_eq!(text, "{}");
+    let (failed, text) = first.search(
+        json!({"question":format!("{prompt}?"), "prefetch":"claude:s1",
+        "directory":repository.path().to_str().unwrap()}),
+    );
+    let context = hook_context(&json!({"result":{"isError":failed, "content":[{"text":text}]}}))
+        .unwrap_or_else(|| panic!("{text}"));
+    assert!(context.contains("fn authenticate_user"), "{context}");
+}

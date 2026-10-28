@@ -11,7 +11,7 @@ use std::{
 };
 use toml_edit::{DocumentMut, Item, Table, value};
 
-const USAGE: &str = "Usage: oko setup [--client codex|claude|opencode|pi|cursor|all] [--root DIRECTORY]\n                 [--no-jev] [--no-instructions] [--no-hooks] [--no-prefetch]\n                 [--install-dir DIRECTORY] [--quiet]\n\nSet up Oko in the chosen project (default: current directory) for one or more\ncoding tools (default: codex; separate several with commas, or use all).\nInstalls a stable copy, checks MCP, then connects each tool:\n  codex     updates .codex/config.toml\n  claude    runs `claude mcp add-json --scope local` (needs the claude command)\n  opencode  updates opencode.json\n  pi        updates .pi/mcp.json (Pi 1.0+)\n  cursor    updates .cursor/mcp.json, .cursor/hooks.json and .cursor/cli.json\nAdds a managed search section to the instructions each tool reads (AGENTS.md,\nand CLAUDE.md for Claude Code) unless --no-instructions is set.\nFor Claude Code it also adds hooks and a permission rule in\n.claude/settings.local.json so the agent and its subagents know Oko is loaded.\nFor all five it adds a prompt hook through which Oko answers a code question\nbefore the agent's first turn (--no-prefetch skips that one; --no-hooks skips\nevery hook).\n--no-jev sets up local-only search without credentials or network calls.\n--install-dir overrides the per-user application bin directory; `oko upgrade`\nrefreshes every project set up with the copy there.\n--quiet prints only errors.";
+const USAGE: &str = "Usage: oko setup [--client codex|claude|opencode|pi|cursor|all] [--root DIRECTORY]\n                 [--no-jev] [--no-instructions] [--no-hooks] [--no-prefetch]\n                 [--install-dir DIRECTORY] [--port PORT] [--quiet]\n\nSet up Oko in the chosen project (default: current directory) for one or more\ncoding tools (default: codex; separate several with commas, or use all).\nInstalls a stable copy, checks MCP, then connects each tool:\n  codex     updates .codex/config.toml\n  claude    runs `claude mcp add-json --scope local` (needs the claude command)\n  opencode  updates opencode.json\n  pi        updates .pi/mcp.json (Pi 1.0+)\n  cursor    updates .cursor/mcp.json, .cursor/hooks.json and .cursor/cli.json\nAdds a managed search section to the instructions each tool reads (AGENTS.md,\nand CLAUDE.md for Claude Code) unless --no-instructions is set.\nFor Claude Code it also adds hooks and a permission rule in\n.claude/settings.local.json so the agent and its subagents know Oko is loaded.\nFor all five it adds a prompt hook through which Oko answers a code question\nbefore the agent's first turn (--no-prefetch skips that one; --no-hooks skips\nevery hook).\n--no-jev sets up local-only search without credentials or network calls.\n--install-dir overrides the per-user application bin directory; `oko upgrade`\nrefreshes every project set up with the copy there.\n--port PORT (with --client claude) connects Claude Code in every project to one\nshared `oko mcp --port PORT` server, which you keep running: the connection is\nuser-scoped and sends each session's directory, and the hooks, permission and\ninstructions go to Claude Code's user settings (~/.claude, or\nCLAUDE_CONFIG_DIR) instead of the project.\n--quiet prints only errors.";
 const MANAGED: &str = "# Managed by oko setup";
 const START: &str = "<!-- oko:search:start -->";
 const END: &str = "<!-- oko:search:end -->";
@@ -93,11 +93,13 @@ struct Options {
     prefetch: bool,
     /// Only errors are printed: `oko upgrade` refreshing its projects.
     quiet: bool,
+    /// Claude Code connects to one shared server on this port.
+    port: Option<u16>,
 }
 fn options(args: &[String], cwd: &Path) -> Result<Options> {
     let (mut root, mut install, mut offline, mut instructions, mut hooks, mut prefetch) =
         (None, None, false, true, true, true);
-    let mut quiet = false;
+    let (mut quiet, mut port) = (false, None);
     let mut chosen = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -116,8 +118,18 @@ fn options(args: &[String], cwd: &Path) -> Result<Options> {
             "--no-hooks" if hooks => hooks = false,
             "--no-prefetch" if prefetch => prefetch = false,
             "--quiet" if !quiet => quiet = true,
+            "--port" if port.is_none() => {
+                port = Some(
+                    args.next()
+                        .and_then(|port| port.parse::<u16>().ok())
+                        .context("--port needs a port number")?,
+                )
+            }
             _ => bail!("Invalid setup arguments.\n{USAGE}"),
         }
+    }
+    if port.is_some() && chosen.as_deref() != Some(&[Client::Claude][..]) {
+        bail!("--port connects Claude Code only; pass --client claude.\n{USAGE}");
     }
     let root = cwd
         .join(root.map_or(".", String::as_str))
@@ -139,6 +151,7 @@ fn options(args: &[String], cwd: &Path) -> Result<Options> {
         hooks,
         prefetch,
         quiet,
+        port,
     })
 }
 
@@ -171,6 +184,8 @@ pub(crate) struct Project {
     pub no_hooks: bool,
     #[serde(default)]
     pub no_prefetch: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
 }
 
 impl Project {
@@ -193,6 +208,9 @@ impl Project {
             if set {
                 args.push(flag.into());
             }
+        }
+        if let Some(port) = self.port {
+            args.extend(["--port".into(), port.to_string().into()]);
         }
         args
     }
@@ -254,6 +272,7 @@ fn record_project(install: &Path, options: &Options) -> Result<()> {
         no_instructions: !options.instructions,
         no_hooks: !options.hooks,
         no_prefetch: !options.prefetch,
+        port: options.port,
     };
     let same = listed.iter().position(|project| {
         Project {
@@ -808,15 +827,18 @@ fn cursor_permissions(original: &str) -> Result<String> {
 struct Claude {
     program: PathBuf,
     root: PathBuf,
+    /// `local` for this project, `user` for a shared server.
+    scope: &'static str,
 }
 impl Claude {
-    fn find(root: &Path) -> Result<Self> {
+    fn find(root: &Path, scope: &'static str) -> Result<Self> {
         let program = env::var_os("OKO_CLAUDE")
             .map(PathBuf::from)
             .unwrap_or_else(|| executable_name("claude").into());
         let claude = Self {
             program,
             root: root.into(),
+            scope,
         };
         if claude.run(&["--version"]).is_err() {
             bail!(
@@ -840,7 +862,8 @@ impl Claude {
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
-    /// Whether a connection named oko exists; an error if it is someone else's.
+    /// Whether this scope has a connection named oko; an error if it is
+    /// someone else's.
     fn existing(&self) -> Result<bool> {
         let Ok(described) = self.run(&["mcp", "get", "oko"]) else {
             return Ok(false);
@@ -851,35 +874,60 @@ impl Claude {
                 .find_map(|line| line.trim().strip_prefix(name))
                 .map(str::trim)
         };
+        // One in another scope stays: a project's own connection beside a
+        // shared one, or the other way round.
+        let scope = field("Scope:").and_then(|scope| scope.split(' ').next());
+        if scope.is_some_and(|scope| !scope.eq_ignore_ascii_case(self.scope)) {
+            return Ok(false);
+        }
         let first_arg = field("Args:").and_then(|args| args.split(' ').next());
-        if !field("Command:").is_some_and(|command| launches_oko(command, first_arg)) {
+        if !field("Command:").is_some_and(|command| launches_oko(command, first_arg))
+            && !field("URL:").is_some_and(serves_oko)
+        {
             bail!(
                 "Claude Code already has an MCP connection named oko that setup did not create. Remove it with `claude mcp remove oko`, then rerun setup."
             );
         }
         Ok(true)
     }
-    fn connect(&self, replace: bool, exe: &Path, rg: &Path, offline: bool) -> Result<()> {
+    fn connect(
+        &self,
+        replace: bool,
+        exe: &Path,
+        rg: &Path,
+        offline: bool,
+        port: Option<u16>,
+    ) -> Result<()> {
         if replace {
-            self.run(&["mcp", "remove", "--scope", "local", "oko"])
+            self.run(&["mcp", "remove", "--scope", self.scope, "oko"])
                 .context("Cannot replace the existing Claude Code connection; remove it with `claude mcp remove oko`, then rerun setup")?;
         }
         // Claude Code defers MCP tools behind a tool search: an agent sees only
         // the bare name until it loads the schema, and explorers never do.
         // `alwaysLoad` needs add-json; `mcp add` has no flag for it.
-        let server = serde_json::json!({
-            "type": "stdio",
-            "command": exe.to_str().context("Executable path must be UTF-8")?,
-            "args": server_args(&self.root, offline)?,
-            "env": {"OKO_RIPGREP": rg.to_str().context("ripgrep path must be UTF-8")?},
-            "alwaysLoad": true,
-        })
+        let server = match port {
+            // Claude Code expands ${PWD} per session, so the shared server
+            // knows the directory each session started in.
+            Some(port) => serde_json::json!({
+                "type": "http",
+                "url": server_url(port),
+                "headers": {"X-Oko-Directory": "${PWD}"},
+                "alwaysLoad": true,
+            }),
+            None => serde_json::json!({
+                "type": "stdio",
+                "command": exe.to_str().context("Executable path must be UTF-8")?,
+                "args": server_args(&self.root, offline)?,
+                "env": {"OKO_RIPGREP": rg.to_str().context("ripgrep path must be UTF-8")?},
+                "alwaysLoad": true,
+            }),
+        }
         .to_string();
         let args = [
             "mcp",
             "add-json",
             "--scope",
-            "local",
+            self.scope,
             "oko",
             server.as_str(),
         ];
@@ -887,6 +935,23 @@ impl Claude {
             .context("Claude Code did not accept the connection")?;
         Ok(())
     }
+}
+/// The address of a shared `oko mcp --port` server.
+fn server_url(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/mcp")
+}
+/// Whether a connection URL is a shared server setup connected.
+fn serves_oko(url: &str) -> bool {
+    url.starts_with("http://127.0.0.1:") && url.ends_with("/mcp")
+}
+/// Claude Code's user configuration, where a shared server's hooks,
+/// permission and instructions go.
+fn claude_config_dir() -> Result<PathBuf> {
+    Ok(match env::var_os("CLAUDE_CONFIG_DIR") {
+        Some(dir) => dir.into(),
+        None => PathBuf::from(env::var_os("HOME").context("Cannot locate home directory")?)
+            .join(".claude"),
+    })
 }
 /// Claude Code settings for this project and user: hooks that tell the main
 /// agent and its subagents that Oko is loaded and remind a grep for code, a
@@ -1433,15 +1498,22 @@ pub fn run(args: &[String], cwd: &Path) -> Result<()> {
             after,
         });
     }
+    // A shared server's Claude Code configuration is the user's, not the project's.
+    let user = options.port.map(|_| claude_config_dir()).transpose()?;
+    let claude_settings_path = match &user {
+        Some(dir) => dir.join("settings.json"),
+        None => options.root.join(".claude").join("settings.local.json"),
+    };
     let claude = if wants(Client::Claude) {
-        let claude = Claude::find(&options.root)?;
+        let scope = if user.is_some() { "user" } else { "local" };
+        let claude = Claude::find(&options.root, scope)?;
         let replace = claude.existing()?;
         Some((claude, replace))
     } else {
         None
     };
     if wants(Client::Claude) && options.hooks {
-        let path = options.root.join(".claude").join("settings.local.json");
+        let path = claude_settings_path.clone();
         let before = text(&path)?;
         let after = claude_settings(
             before.as_deref().unwrap_or(""),
@@ -1453,21 +1525,26 @@ pub fn run(args: &[String], cwd: &Path) -> Result<()> {
             before,
             after,
         });
-        ignored.push((
-            "/.claude/settings.local.json",
-            "# Oko: machine-local Claude Code hooks and permissions",
-        ));
+        if user.is_none() {
+            ignored.push((
+                "/.claude/settings.local.json",
+                "# Oko: machine-local Claude Code hooks and permissions",
+            ));
+        }
     }
     if options.instructions {
         // Codex, OpenCode, Pi and Cursor read AGENTS.md; Claude Code reads CLAUDE.md, which
         // may itself import AGENTS.md.
         let agents = options.root.join("AGENTS.md");
+        // Links in the user's configuration may lead anywhere inside it.
+        let base = user.as_deref().unwrap_or(&options.root);
         let mut paths = Vec::new();
         for client in &options.clients {
             let path = match client {
                 Client::Codex | Client::Pi if options.root.join("AGENTS.override.md").exists() => {
                     options.root.join("AGENTS.override.md")
                 }
+                Client::Claude if user.is_some() => base.join("CLAUDE.md"),
                 Client::Claude => {
                     let own = instruction_file(&options.root, options.root.join("CLAUDE.md"))?;
                     if text(&own)?.is_some_and(|text| text.contains("@AGENTS.md")) {
@@ -1479,7 +1556,7 @@ pub fn run(args: &[String], cwd: &Path) -> Result<()> {
                 _ => agents.clone(),
             };
             // A linked CLAUDE.md and AGENTS.md are one file and get one section.
-            let path = instruction_file(&options.root, path)?;
+            let path = instruction_file(base, path)?;
             if !paths.contains(&path) {
                 paths.push(path);
             }
@@ -1494,27 +1571,30 @@ pub fn run(args: &[String], cwd: &Path) -> Result<()> {
             });
         }
     }
-    let ignore_path = options.root.join(".gitignore");
-    let original = text(&ignore_path)?;
-    let mut updated = original.clone().unwrap_or_default();
-    ignored.push(("/.env", ""));
-    for (entry, comment) in ignored {
-        if updated.lines().any(|line| line == entry) {
-            continue;
+    // A shared server writes nothing into the project.
+    if user.is_none() {
+        let ignore_path = options.root.join(".gitignore");
+        let original = text(&ignore_path)?;
+        let mut updated = original.clone().unwrap_or_default();
+        ignored.push(("/.env", ""));
+        for (entry, comment) in ignored {
+            if updated.lines().any(|line| line == entry) {
+                continue;
+            }
+            if !updated.is_empty() && !updated.ends_with('\n') {
+                updated.push('\n');
+            }
+            if !comment.is_empty() {
+                updated.push_str(&format!("\n{comment}\n"));
+            }
+            updated.push_str(&format!("{entry}\n"));
         }
-        if !updated.is_empty() && !updated.ends_with('\n') {
-            updated.push('\n');
-        }
-        if !comment.is_empty() {
-            updated.push_str(&format!("\n{comment}\n"));
-        }
-        updated.push_str(&format!("{entry}\n"));
+        edits.push(Edit {
+            path: ignore_path,
+            before: original,
+            after: updated,
+        });
     }
-    edits.push(Edit {
-        path: ignore_path,
-        before: original,
-        after: updated,
-    });
     let names = options
         .clients
         .iter()
@@ -1537,7 +1617,7 @@ pub fn run(args: &[String], cwd: &Path) -> Result<()> {
     healthcheck(&executable, &options.root, &rg, options.offline)?;
     // Before the files: a refusal here leaves the project untouched.
     if let Some((claude, replace)) = &claude {
-        claude.connect(*replace, &executable, &rg, options.offline)?;
+        claude.connect(*replace, &executable, &rg, options.offline, options.port)?;
     }
     apply(&edits, &install.join("setup-backups"), options.quiet)?;
     for plugin in stale_plugins {
@@ -1552,6 +1632,17 @@ pub fn run(args: &[String], cwd: &Path) -> Result<()> {
         executable.display()
     );
     for client in &options.clients {
+        if let (Client::Claude, Some(port)) = (client, options.port) {
+            println!(
+                "Claude Code connection to {} added for every project, with its hooks and permission in {}. Keep the shared server running (restart it after an upgrade):\n  OKO_RIPGREP={} {} mcp --port {port}{}\nThen start a new session and use /mcp to check it.",
+                server_url(port),
+                claude_settings_path.display(),
+                shell_word(rg.to_str().unwrap_or_default()),
+                shell_word(executable.to_str().unwrap_or_default()),
+                if options.offline { " --no-jev" } else { "" },
+            );
+            continue;
+        }
         println!(
             "{}",
             match client {
@@ -1584,9 +1675,11 @@ pub fn run(args: &[String], cwd: &Path) -> Result<()> {
             "opencode.json already existed, so it was not added to .gitignore; it now holds paths for this machine. Keep that change out of shared commits."
         );
     }
-    println!(
-        "Machine-specific configuration that setup created is added to .gitignore (already-tracked files remain tracked). Run setup for each project you want to connect."
-    );
+    if user.is_none() {
+        println!(
+            "Machine-specific configuration that setup created is added to .gitignore (already-tracked files remain tracked). Run setup for each project you want to connect."
+        );
+    }
     Ok(())
 }
 
