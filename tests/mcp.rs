@@ -3140,7 +3140,10 @@ impl HttpClient {
         let result = &response["result"];
         (
             result["isError"] == true,
-            result["content"][0]["text"].as_str().unwrap().to_owned(),
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap_or_else(|| panic!("{response}"))
+                .to_owned(),
         )
     }
 }
@@ -3227,17 +3230,37 @@ fn one_http_server_serves_every_session_in_the_repository_each_search_names() {
         assert!(!text.contains("Paths are relative"), "{text}");
     }
 
-    // On 2026-07-28 there are no sessions and no roots: the client's MCP
-    // config names its directory in a header instead.
+    // 2026-07-28 has no sessions, so a session's memory would not last
+    // between calls: a client offering it gets the latest revision with
+    // sessions, and its MCP config names its directory in a header.
+    let mut headed = HttpClient::connect_with(&url, None, Some(&server), "2026-07-28");
+    headed.version = None;
+    let offered = headed.request("initialize", json!({"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"oko-tests","version":"1"}}));
+    assert_eq!(
+        offered["result"]["protocolVersion"], "2025-11-25",
+        "{offered}"
+    );
+    assert!(headed.session.is_some());
+    headed.version = Some("2025-11-25".into());
+    headed.post(json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    let (failed, text) = headed.search(json!({"question":"authentication token"}));
+    assert!(!failed, "{text}");
+    assert!(text.contains("Paths are relative to server/."), "{text}");
+
+    // A client that skips the handshake is told which revisions to use.
     let mut stateless = HttpClient::connect_with(&url, None, Some(&server), "2026-07-28");
-    for args in [
-        json!({"question":"authentication token"}),
-        json!({"question":"authentication token", "directory":"."}),
-    ] {
-        let (failed, text) = stateless.search(args);
-        assert!(!failed, "{text}");
-        assert!(text.contains("Paths are relative to server/."), "{text}");
-    }
+    let refused = stateless.request(
+        "tools/call",
+        json!({"name":"search","arguments":{"question":"authentication token"}}),
+    );
+    assert_eq!(
+        refused["error"]["data"]["supported"]
+            .as_array()
+            .unwrap()
+            .last(),
+        Some(&json!("2025-11-25")),
+        "{refused}"
+    );
 
     // The prompt hook passes the session's directory; without one, and
     // without roots, there is nothing to search and the prompt goes on.
